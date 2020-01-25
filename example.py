@@ -7,7 +7,7 @@
 #
 # Distributed under terms of the MIT license.
 # --------------------------------------------------------------------
-from sensors import sensor, gauge, when, state, start, sh
+from readout import sensor, gauge, when, state, start, sh
 
 # --------------------------------------------------------------------
 # Predicate syntax legend:
