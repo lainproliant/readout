@@ -23,15 +23,13 @@ setup(
         "Topic :: Software Development :: Libraries :: Application Frameworks",
         "License :: OSI Approved :: BSD License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.5",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8"
     ],
-    keywords="IOC dependency injector",
+    keywords="monitoring framework API",
     packages=find_packages(),
     install_requires=[],
     extras_require={},
-    package_data={'readout': []},
+    package_data={'readout': ['LICENSE']},
     data_files=[],
     entry_points={"console_scripts": []},
 )
