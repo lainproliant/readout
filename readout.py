@@ -14,15 +14,27 @@ import os
 import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import (Any, Awaitable, Dict, Generic, List, Optional, Sequence,
-                    Set, Tuple, Type, TypeVar)
+from typing import (
+    Any,
+    Awaitable,
+    Collection,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
 import ansilog
 import nanoid
 from lexex import Lexeme, Lexer
 
 # --------------------------------------------------------------------
-if os.environ.get('SENSOR_DEBUG') == '1':
+if os.environ.get("READOUT_DEBUG") == "1":
     ansilog.handler.setLevel(logging.DEBUG)
 
 # --------------------------------------------------------------------
@@ -57,10 +69,7 @@ predicate_lex = Lexer(
             (Lexer.IGNORE, "\\s+"),
             ("state", NAME_RX, "state_to_qq", lambda x: str(x)),
         ),
-        "state_to_qq": (
-            (Lexer.IGNORE, "\\s+"),
-            ("to", "->", "state_to"),
-        ),
+        "state_to_qq": ((Lexer.IGNORE, "\\s+"), ("to", "->", "state_to"),),
         "state_to": (
             (Lexer.IGNORE, "\\s+"),
             ("state", NAME_RX, "state_to", lambda x: str(x)),
@@ -72,50 +81,94 @@ predicate_lex = Lexer(
 
 # --------------------------------------------------------------------
 def get_id():
+    """Get a random small string ID."""
     return nanoid.generate(size=10)
 
 
 # --------------------------------------------------------------------
 async def async_map(coro: Awaitable[T], value: U) -> Tuple[T, U]:
+    """Pair another value to be returned with an awaitable."""
     return await coro, value
 
 
 # --------------------------------------------------------------------
-async def sh(cmd: str, timeout=timedelta(seconds=5)) -> str:
+async def sh(cmd: str, timeout=timedelta(seconds=10), stdout=True, stderr=False):
+    """Invoke a shell command, capturing the output and returning it.
+    If `stdout` or `stderr` are set to True (stdin by default is True), the output
+    is decoded and returned.  If both are True, a tuple of both decoded outputs
+    is returned.  If none are True, None is returned."""
+
     proc = await asyncio.create_subprocess_shell(
         cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout.total_seconds())
-    return stdout.decode("utf-8").strip()
+    out, err = await asyncio.wait_for(proc.communicate(), timeout.total_seconds())
+
+    if stdout and stderr:
+        return out.decode("utf-8").strip(), err.decode("utf-8").strip()
+    if stdout:
+        return out.decode("utf-8").strip()
+    if stderr:
+        return err.decode("utf-8").strip()
+    return None
+
+
+# --------------------------------------------------------------------
+class ScheduledItem:
+    """An object that is updated/invoked at a given interval."""
+
+    def __init__(self, freq: timedelta):
+        self.freq = freq
+        self.last_updated_time = datetime(1900, 1, 1)
+
+    def scheduled_for(self) -> datetime:
+        """Get the next scheduled time this item should be updated/invoked."""
+        return self.last_updated_time + self.freq
+
+    def schedule_next(self):
+        self.last_updated_time = datetime.now()
+
+    async def update(self) -> bool:
+        raise NotImplementedError()
 
 
 # --------------------------------------------------------------------
 @dataclass
-class Readout(Generic[T]):
-    name: str
-    freq: timedelta
-    timeout = timedelta(seconds=5)
-    last_updated_time = datetime(1900, 1, 1)
-    value: Optional[T] = None
-    id: str = field(default_factory=get_id)
+class Readout(ScheduledItem, Generic[T]):
+    """A generic class for an object that provides quantitative (Sensor) or
+    qualitative (Gauge) readings at regular intervals."""
+
     log = ansilog.getLogger("sensors.Readout")
 
+    def __init__(self, name: str, freq: timedelta):
+        super().__init__(freq)
+        self.value: Optional[T] = None
+        self.name = name
+        self.freq = freq
+        self.id = get_id()
+
     def scheduled_for(self) -> datetime:
+        """Get the next scheduled time this readout should be read."""
         return self.last_updated_time + self.freq
 
     async def get_value(self) -> T:
+        """Update the value of the readout from some outside source."""
         raise NotImplementedError()
 
     def read(self) -> T:
+        """Read the latest value from the readout.  Raises ValueError if the
+        readout has never been updated."""
         if self.value is not None:
             return self.value
         raise ValueError("The sensor has never been updated.")
 
     async def update(self) -> bool:
-        self.last_updated_time = datetime.now()
+        """Trigger the readout value to be updated, then schedules the next
+        update time.  Returns True if the readout value changed, False
+        otherwise."""
+        self.schedule_next()
         old_value = self.value
         try:
             self.value = await self.get_value()
@@ -144,6 +197,10 @@ Gauge = Readout[int]
 
 # --------------------------------------------------------------------
 class Predicate:
+    """An abstract class for an object which encloses the logical predicate of
+    an event.  In other words, this object is responsible for checking if a
+    given condition is True, which if True, an event should occur."""
+
     def __init__(self, relevance: Set[str] = set()):
         self.id = get_id()
         self.relevance = relevance
@@ -158,20 +215,30 @@ class Predicate:
         return f"{machine.name}@" in self.relevance
 
     def signature(self) -> str:
+        """Return a unique signature for this predicate.  This could be an ID
+        or a string representation of the logical predicate itself, but must
+        be unique from different predicates."""
         raise NotImplementedError()
 
     @staticmethod
     def parse(expr: str) -> "Predicate":
+        """Parse a string expression corresponding to an ExpressionPredicate or
+        StateTransitionPredicate.  Returns the parsed predicate.  Raises
+        ValueError if the string could not be parsed."""
         tokens = predicate_lex.tokenize(expr)
-        if len(tokens) == 3 and tokens[1].type.name == 'op':
+        if len(tokens) == 3 and tokens[1].type.name == "op":
             return ExpressionPredicate(*tokens)
-        if len(tokens) >= 3 and tokens[1].type.name == 'at':
+        if len(tokens) >= 3 and tokens[1].type.name == "at":
             return StateTransitionPredicate(*tokens)
         raise ValueError(f"Could not parse predicate expression: '{expr}'")
 
 
 # --------------------------------------------------------------------
 class ExpressionPredicate(Predicate):
+    """A predicate described by a small DSL, where named readouts can be
+    compared with string or integer values.  For a definition of this DSL, see
+    `readout.predicate_lex`."""
+
     def __init__(self, readout_t: Lexeme, op_t: Lexeme, value_t: Lexeme):
         self.readout_name = readout_t.content
         self.op = op_t.type.data
@@ -188,12 +255,19 @@ class ExpressionPredicate(Predicate):
 
 # --------------------------------------------------------------------
 class StateTransitionPredicate(Predicate):
-    def __init__(self,
-                 name_t: Lexeme,
-                 at_t: Lexeme,
-                 state_t: Lexeme,
-                 to_t: Lexeme = None,
-                 to_state_t: Lexeme = None):
+    """A predicate described by a small DSL, where entering a given state,
+    exiting a given state, or entering a given state from another given state
+    can be specified.  For a definition of this DSL, see
+    `readout.predicate_lex`."""
+
+    def __init__(
+        self,
+        name_t: Lexeme,
+        at_t: Lexeme,
+        state_t: Lexeme,
+        to_t: Lexeme = None,
+        to_state_t: Lexeme = None,
+    ):
         self.machine_name = name_t.content
         self.state = state_t.content
         self._signature = name_t.content + at_t.content + state_t.content
@@ -211,8 +285,7 @@ class StateTransitionPredicate(Predicate):
         if self.to_state is ANY_STATE:
             return machine.from_state == self.state
         if self.to_state is not None:
-            return (machine.from_state == self.state
-                    and machine.state == self.to_state)
+            return machine.from_state == self.state and machine.state == self.to_state
         return machine.state == self.state
 
     def signature(self):
@@ -221,6 +294,8 @@ class StateTransitionPredicate(Predicate):
 
 # --------------------------------------------------------------------
 class CompoundPredicate(Predicate):
+    """A combination of multiple predicates, all of which must be True to satisfy."""
+
     def __init__(self, predicates: Sequence[Predicate]):
         self.predicates = predicates
         super().__init__(self._flat_relevance())
@@ -268,8 +343,30 @@ class EventHandler:
 
 
 # --------------------------------------------------------------------
+class Agent(ScheduledItem):
+    """An autonomous agent which is invoked at a given interval."""
+
+    def __init__(self, engine: "Engine", freq: timedelta):
+        super().__init__(freq)
+        self.engine = engine
+
+    async def invoke(self) -> None:
+        raise NotImplementedError()
+
+    async def update(self) -> bool:
+        self.schedule_next()
+        await self.invoke()
+        return True
+
+    def signature(self) -> str:
+        """Return a unique signature for this agent."""
+        raise NotImplementedError()
+
+
+# --------------------------------------------------------------------
 class Engine:
     def __init__(self, name="Sensor Engine"):
+        self.names = set()
         self.readouts_by_name: Dict[str, str] = {}
         self.readouts_table: Dict[str, Readout[Any]] = {}
         self.predicates_table: Dict[str, Predicate] = {}
@@ -279,6 +376,7 @@ class Engine:
         self.handlers_table: Dict[str, List[EventHandler]] = {}
         self.predicates_by_signature: Dict[str, str] = {}
         self.machine_table: Dict[str, StateMachine] = {}
+        self.agents: List[Agent] = []
         self.name = name
         self.log = ansilog.getLogger("sensors.Engine")
         self.log.setLevel(logging.DEBUG)
@@ -287,6 +385,11 @@ class Engine:
     def shutdown(self):
         self.log.debug(f"Shutdown requested for '{self.name}'.")
         self._alive = False
+
+    def add_agent(self, agent: Agent) -> Agent:
+        self.agents.append(agent)
+        self.log.debug(f"Added agent: '{agent.signature()}'")
+        return agent
 
     def add_predicate(self, predicate: Predicate) -> Predicate:
         signature = predicate.signature()
@@ -308,14 +411,17 @@ class Engine:
         return self.predicates_table[id]
 
     def add_event(self, event: Event) -> Event:
-        assert event.name not in self.events_by_name
+        assert event.name not in self.names
         predicate = self.get_predicate(id=event.predicate_id)
         self.events_table[event.id] = event
         self.events_by_name[event.name] = event.id
+        self.names.add(event.name)
         events_by_predicate = self.events_by_predicate.get(event.predicate_id, [])
         events_by_predicate.append(event.id)
         self.events_by_predicate[event.predicate_id] = events_by_predicate
-        self.log.debug(f"Added event: '{event.name}' ({event.id}) with predicate '{predicate.signature()}' ({predicate.id})")
+        self.log.debug(
+            f"Added event: '{event.name}' ({event.id}) with predicate '{predicate.signature()}' ({predicate.id})"
+        )
         return event
 
     def get_events_for_predicate(self, predicate: Predicate):
@@ -348,9 +454,10 @@ class Engine:
         return [*self.handlers_table.get(event.id, [])]
 
     def add_readout(self, readout: Readout[T]) -> Readout[T]:
-        assert readout.name not in self.readouts_by_name
+        assert readout.name not in self.names
         self.readouts_table[readout.id] = readout
         self.readouts_by_name[readout.name] = readout.id
+        self.names.add(readout.name)
         self.log.debug(f"Added readout: '{readout.name}'")
         return readout
 
@@ -362,9 +469,11 @@ class Engine:
         return self.readouts_table[id]
 
     def add_state_machine(self, machine: StateMachine) -> StateMachine:
+        assert machine.name not in self.names
         if machine.name in self.machine_table:
             return self.machine_table[machine.name]
         self.machine_table[machine.name] = machine
+        self.names.add(machine.name)
         return machine
 
     def get_state_machine(self, name: str) -> StateMachine:
@@ -378,7 +487,9 @@ class Engine:
             return
         machine.from_state = machine.state
         machine.state = state
-        self.log.info(f"{ansilog.fg.cyan('[' + machine.name + ']')} {machine.from_state} -> {machine.state}.")
+        self.log.info(
+            f"{ansilog.fg.cyan('[' + machine.name + ']')} {machine.from_state} -> {machine.state}."
+        )
         try:
             predicates = await self._check_predicates_for_state_machine(machine)
             events = self._get_events_for_predicates(predicates)
@@ -409,10 +520,10 @@ class Engine:
 
         return decorator
 
-    def sensor(self, freq=timedelta(seconds=1)):
+    def sensor(self, freq=timedelta(seconds=10)):
         return self._mk_readout_decorator(Sensor, freq)
 
-    def gauge(self, freq=timedelta(seconds=1)):
+    def gauge(self, freq=timedelta(seconds=10)):
         return self._mk_readout_decorator(Gauge, freq)
 
     def when(self, *conditions, event_name=None):
@@ -435,21 +546,20 @@ class Engine:
         predicate = self.add_predicate(predicate)
 
         def decorator(f):
-            name = event_name if f.__name__ == '__handler' else f.__name__
+            name = event_name if f.__name__ == "__handler" else f.__name__
             if name is None:
                 name = f"handler-{get_id()}"
             event = self.add_event(Event(name, predicate.id))
 
             class FuncEventHandler(EventHandler):
                 def __init__(self, event):
-                    self.event = event
                     super().__init__(event.id)
 
                 async def handle(self, event, engine) -> None:
                     kwargs: Dict[str, Any] = {}
                     params = inspect.signature(f).parameters
                     if "engine" in params:
-                        kwargs["engine"] = self
+                        kwargs["engine"] = engine
                     if "event" in params:
                         kwargs["event"] = event
                     if inspect.iscoroutinefunction(f):
@@ -467,7 +577,10 @@ class Engine:
         predicate = Predicate.parse(expr)
         if not isinstance(predicate, StateTransitionPredicate):
             raise ValueError(f"Invalid state expression: '{expr}'.")
-        machine = self.add_state_machine(StateMachine(predicate.machine_name))
+        try:
+            machine = self.get_state_machine(predicate.machine_name)
+        except ValueError:
+            machine = self.add_state_machine(StateMachine(predicate.machine_name))
         state = predicate.to_state or predicate.state
 
         def decorator(f):
@@ -477,16 +590,40 @@ class Engine:
             self.when(expr, event_name=get_id())(f)
 
             return __handler
+
+        return decorator
+
+    def agent(self, freq=timedelta(seconds=10)):
+        def decorator(f):
+            class FuncAgent(Agent):
+                def __init__(self, engine: "Engine", freq: timedelta):
+                    super().__init__(engine, freq)
+
+                async def invoke(self) -> None:
+                    params = inspect.signature(f).parameters.keys()
+                    kwargs = self.engine._get_agent_params(params)
+                    if inspect.iscoroutinefunction(f):
+                        await f(**kwargs)
+                    else:
+                        f(**kwargs)
+
+                def signature(self) -> str:
+                    return f.__qualname__
+
+            agent = FuncAgent(self, freq)
+            self.add_agent(agent)
+            return agent
+
         return decorator
 
     def _on_sigint(self, signal, frame):
-        self.log.info('')
-        self.log.warning('Received SIGINT, shutting down...')
+        self.log.info("")
+        self.log.warning("Received SIGINT, shutting down...")
         self.shutdown()
 
     def _on_sigterm(self, signal, frame):
-        self.log.info('')
-        self.log.warning('Received SIGTERM, shutting down...')
+        self.log.info("")
+        self.log.warning("Received SIGTERM, shutting down...")
         self.shutdown()
 
     def start(self):
@@ -504,25 +641,28 @@ class Engine:
             while self._alive:
                 loop.run_until_complete(self.run(loop))
 
-            self.log.info(f"{ansilog.fg.red('[stop]')} {self.name}")
+            self.log.info(f"{ansilog.fg.red('[stop]')} {self.name}.")
         finally:
             signal.signal(signal.SIGTERM, old_sigterm_handler)
             signal.signal(signal.SIGINT, old_sigint_handler)
 
     async def run(self, loop: asyncio.AbstractEventLoop):
         updated_readouts = await self._update_readouts()
-        satisfied_predicates = await self._check_predicates_for_readouts(updated_readouts)
+        satisfied_predicates = await self._check_predicates_for_readouts(
+            updated_readouts
+        )
         events = self._get_events_for_predicates(satisfied_predicates)
         await self._trigger_events(events)
+        await self._update_agents()
 
-        readout = self._get_next_scheduled_readout()
-        if not readout:
-            self.log.error("There are no readouts.  Bailing out.")
+        item = self._get_next_scheduled_item()
+        if not item:
+            self.log.error("There are no items to update.  Bailing out.")
             self.shutdown()
             return
 
         now = datetime.now()
-        next_update = readout.scheduled_for()
+        next_update = item.scheduled_for()
         if next_update > now:
             await asyncio.sleep((next_update - now).total_seconds())
 
@@ -546,7 +686,12 @@ class Engine:
                 updated_readouts.append(readout)
         return updated_readouts
 
-    async def _check_predicates(self, predicates: Sequence[Predicate]) -> Sequence[Predicate]:
+    async def _update_agents(self) -> None:
+        await asyncio.gather(*(a.update() for a in self.agents))
+
+    async def _check_predicates(
+        self, predicates: Sequence[Predicate]
+    ) -> Sequence[Predicate]:
         satisfied_predicates: List[Predicate] = []
         for result in await asyncio.gather(
             *(async_map(p.check(self), p) for p in predicates)
@@ -568,11 +713,15 @@ class Engine:
         return await self._check_predicates(predicates_to_check)
 
     async def _check_predicates_for_state_machine(
-            self, machine: StateMachine) -> Sequence[Predicate]:
-        return await self._check_predicates([
-            p for p in self.predicates_table.values()
-            if p.relevant_to_state_machine(machine)
-        ])
+        self, machine: StateMachine
+    ) -> Sequence[Predicate]:
+        return await self._check_predicates(
+            [
+                p
+                for p in self.predicates_table.values()
+                if p.relevant_to_state_machine(machine)
+            ]
+        )
 
     def _get_events_for_predicates(
         self, predicates: Sequence[Predicate]
@@ -585,14 +734,34 @@ class Engine:
     async def _trigger_events(self, events: Sequence[Event]):
         await asyncio.gather(*(self.trigger_event(e) for e in events))
 
-    def _get_next_scheduled_readout(self) -> Optional[Readout]:
-        if not self.readouts_table:
+    def _get_next_scheduled_item(self) -> Optional[ScheduledItem]:
+        if not self.readouts_table and not self.agents:
             return None
-        return min(self.readouts_table.values(), key=lambda r: r.scheduled_for())
+        return min(
+            [*self.readouts_table.values(), *self.agents],
+            key=lambda r: r.scheduled_for(),
+        )
+
+    def _get_agent_param(self, param: str) -> Any:
+        try:
+            machine = self.get_state_machine(param)
+            return machine.state
+        except ValueError:
+            pass
+
+        try:
+            readout: Readout[Any] = self.get_readout(param)
+            return readout.read()
+        except ValueError:
+            return None
+
+    def _get_agent_params(self, params: Collection[str]) -> Dict[str, Any]:
+        return {p: self._get_agent_param(p) for p in params}
 
 
 # --------------------------------------------------------------------
 engine = Engine()
+agent = engine.agent
 sensor = engine.sensor
 gauge = engine.gauge
 when = engine.when

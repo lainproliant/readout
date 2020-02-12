@@ -11,7 +11,7 @@ with open(path.join(here, "README.md"), encoding="utf-8") as f:
 
 setup(
     name="readout",
-    version="0.1",
+    version="0.1.1",
     description="A framework for detecting changes and reacting to them.",
     long_description=long_description,
     url="https://github.com/lainproliant/readout",
@@ -26,8 +26,8 @@ setup(
         "Programming Language :: Python :: 3.8"
     ],
     keywords="monitoring framework API",
-    packages=find_packages(),
-    install_requires=[],
+    py_modules=['readout'],
+    install_requires=["lexex"],
     extras_require={},
     package_data={'readout': ['LICENSE']},
     data_files=[],
